@@ -1,12 +1,13 @@
 use axum::{
-    body::{boxed, BoxBody, Bytes},
+    body::{boxed, BoxBody, Bytes, Full},
     extract::{BodyStream, Multipart, Path, Query},
-    response::{Html, Redirect, Response},
-    routing::{get, post},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, get_service, post},
     BoxError, Form, Router,
 };
+use axum_extra::routing::SpaRouter;
 use futures::{Stream, TryStreamExt};
-use hyper::{Body, Request, StatusCode, Uri};
+use hyper::{header::CONTENT_TYPE, Body, HeaderMap, Request, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -40,7 +41,8 @@ async fn main() {
         .route("/logged_in", get(logged_in))
         .route("/login_fail", get(login_fail))
         .route("/thank_you", get(thank_you))
-        .route("/contact_submit", post(contact_submit));
+        .route("/contact_submit", post(contact_submit))
+        .route("/download/:filename", get(down));
 
     // run it
     let addr = SocketAddr::from((
@@ -88,29 +90,6 @@ async fn handler() -> Html<&'static str> {
     Html("<h1>Hello, World!</h1>")
 }
 
-// Handler that streams the request body to a file.
-//
-// POST'ing to `/file_upload/foo.txt` will create a file called `foo.txt`.
-async fn save_request_body(
-    Path(file_name): Path<String>,
-    body: BodyStream,
-) -> Result<(), (StatusCode, String)> {
-    todo!()
-}
-
-async fn get_static_file(uri: Uri) -> Result<Response<BoxBody>, (StatusCode, String)> {
-    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-
-    // `ServeDir` implements `tower::Service` so we can call it with `tower::ServiceExt::oneshot`
-    match ServeDir::new(".").oneshot(req).await {
-        Ok(response) => Ok(response.map(boxed)),
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Something went wrong: {}", err),
-        )),
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct LoginForm {
     username: String,
@@ -128,12 +107,12 @@ const VALID: &[(&str, &str)] = &[
 async fn login_submit(Form(login): Form<LoginForm>) -> Redirect {
     if VALID.contains(&(login.username.as_str(), login.password.as_str())) {
         if login.username == "plank" {
-            Redirect::temporary("/admin")
+            Redirect::temporary("/admin/")
         } else {
             Redirect::temporary(&format!("/logged_in?username={}", login.username))
         }
     } else {
-        Redirect::temporary("/login_fail")
+        Redirect::temporary("/login_fail/")
     }
 }
 
@@ -239,7 +218,9 @@ async fn contact_submit(mut multipart: Multipart) -> Redirect {
         .await
         .unwrap();
 
-    Redirect::temporary("/thank_you")
+    println!("redirecting...");
+
+    Redirect::temporary("/thank_you/")
 }
 
 // Save a `Stream` to a file
@@ -284,4 +265,47 @@ fn path_is_valid(path: &str) -> bool {
     }
 
     components.count() == 1
+}
+
+async fn common_download(file_name: &String) -> impl IntoResponse {
+    let workdir = env::current_dir(); // may crash
+    if let Ok(workdir) = workdir {
+        let path = format!("{}/{}/{}", workdir.display(), UPLOADS_DIRECTORY, file_name);
+        if !std::path::Path::new(&path).exists() {
+            return (StatusCode::NOT_FOUND, "file not exists").into_response();
+        }
+        if let Ok(buff) = read_a_file(&path).await {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+            let response = Response::new(Full::from(buff));
+            let (mut parts, body) = response.into_parts();
+            parts.status = StatusCode::OK;
+            parts.headers = headers;
+            let response = Response::from_parts(parts, body);
+            return response.into_response();
+        }
+    }
+    return (StatusCode::NOT_FOUND, "inner error").into_response();
+}
+
+pub async fn down(Path(file_name): Path<String>) -> impl IntoResponse {
+    // pub async fn down(Path(file_name): Path<String>) -> Response<BoxBody> {
+    //println!("filename: {}", &file_name);
+    return common_download(&file_name).await.into_response();
+}
+
+pub async fn down2(req: Request<Body>) -> impl IntoResponse {
+    let file_name = req.uri().path().to_string();
+    //println!("filename: {}", &file_name);
+    return common_download(&file_name).await.into_response();
+}
+
+async fn read_a_file(filename: &String) -> std::io::Result<Vec<u8>> {
+    //println!("filename: {}", &filename);
+    let mut data = Vec::new();
+    let mut file = File::open(&filename).await.expect("no file found");
+    file.read_to_end(&mut data)
+        .await
+        .expect("unable read_to_end");
+    return Ok(data);
 }
