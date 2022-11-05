@@ -1,15 +1,23 @@
 use axum::{
-    body::{boxed, BoxBody},
-    extract::{BodyStream, Path, Query},
+    body::{boxed, BoxBody, Bytes},
+    extract::{BodyStream, Multipart, Path, Query},
     response::{Html, Redirect, Response},
-    routing::get,
-    Form, Router,
+    routing::{get, post},
+    BoxError, Form, Router,
 };
+use futures::{Stream, TryStreamExt};
 use hyper::{Body, Request, StatusCode, Uri};
-use serde::Deserialize;
-use std::{env, fs::read_to_string, net::SocketAddr, path::PathBuf};
+use serde::{Deserialize, Serialize};
+use std::{env, fs::read_to_string, io, net::SocketAddr, path::PathBuf};
+use tokio::{
+    fs::{write, File, OpenOptions},
+    io::BufWriter,
+};
+use tokio_util::io::StreamReader;
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
+
+const UPLOADS_DIRECTORY: &str = "uploads";
 
 #[tokio::main]
 async fn main() {
@@ -23,7 +31,8 @@ async fn main() {
         .route("/login_submit", get(login_submit))
         .route("/admin", get(admin))
         .route("/logged_in", get(logged_in))
-        .route("/login_fail", get(login_fail));
+        .route("/login_fail", get(login_fail))
+        .route("/contact_submit", post(contact_submit));
 
     // run it
     let addr = SocketAddr::from((
@@ -135,4 +144,91 @@ async fn logged_in(Query(LoggedInQuery { username }): Query<LoggedInQuery>) -> H
             .await
             .replace("REPLACE_USERNAME", &username),
     )
+}
+
+#[derive(Serialize, Deserialize)]
+struct ContactFormFields {
+    name: String,
+    email: String,
+    phone: String,
+}
+
+async fn contact_submit(mut multipart: Multipart) -> Redirect {
+    let mut name: String = String::new();
+    let mut email: String = String::new();
+    let mut phone: String = String::new();
+    let mut filename: String = String::new();
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        match field.name().unwrap() {
+            "name" => {
+                name = field.text().await.unwrap();
+                continue;
+            }
+            "email" => {
+                email = field.text().await.unwrap();
+                continue;
+            }
+            "phone" => {
+                phone = field.text().await.unwrap();
+                continue;
+            }
+            _ => {}
+        };
+
+        filename = field.file_name().unwrap().to_owned();
+        stream_to_file(&filename, field).await.unwrap();
+    }
+    let infofile = format!("{}.cyberforce.json", filename);
+
+    let data = ContactFormFields { name, email, phone };
+
+    write(infofile, serde_json::to_string(&data).unwrap())
+        .await
+        .unwrap();
+
+    Redirect::temporary("/thank_you")
+}
+
+// Save a `Stream` to a file
+async fn stream_to_file<S, E>(path: &str, stream: S) -> Result<(), (StatusCode, String)>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: Into<BoxError>,
+{
+    if !path_is_valid(path) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path".to_owned()));
+    }
+
+    async {
+        // Convert the stream into an `AsyncRead`.
+        let body_with_io_error = stream.map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+        let body_reader = StreamReader::new(body_with_io_error);
+        futures::pin_mut!(body_reader);
+
+        // Create the file. `File` implements `AsyncWrite`.
+        let path = std::path::Path::new(UPLOADS_DIRECTORY).join(path);
+        let mut file = BufWriter::new(File::create(path).await?);
+
+        // Copy the body into the file.
+        tokio::io::copy(&mut body_reader, &mut file).await?;
+
+        Ok::<_, io::Error>(())
+    }
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+// to prevent directory traversal attacks we ensure the path consists of exactly one normal
+// component
+fn path_is_valid(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    let mut components = path.components().peekable();
+
+    if let Some(first) = components.peek() {
+        if !matches!(first, std::path::Component::Normal(_)) {
+            return false;
+        }
+    }
+
+    components.count() == 1
 }
