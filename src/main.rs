@@ -2,12 +2,12 @@ use axum::{
     body::{boxed, BoxBody},
     extract::{BodyStream, Path, Query},
     response::{Html, Redirect, Response},
-    routing::{get, post},
-    Router,
+    routing::get,
+    Form, Router,
 };
 use hyper::{Body, Request, StatusCode, Uri};
 use serde::Deserialize;
-use std::{fs::read_to_string, net::SocketAddr, path::PathBuf};
+use std::{env, fs::read_to_string, net::SocketAddr, path::PathBuf};
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
 
@@ -19,10 +19,19 @@ async fn main() {
         .route("/contact", get(contact))
         .route("/solar", get(solar))
         .route("/login", get(login))
-        .route("/manufacturing", get(manufacturing));
+        .route("/manufacturing", get(manufacturing))
+        .route("/login_submit", get(login_submit))
+        .route("/admin", get(admin))
+        .route("/logged_in", get(logged_in))
+        .route("/login_fail", get(login_fail));
 
     // run it
-    let addr = SocketAddr::from(([0, 0, 0, 0], 80));
+    let addr = SocketAddr::from((
+        [0, 0, 0, 0],
+        env::var("PORT")
+            .map(|p| -> u16 { p.as_str().parse::<u16>().unwrap() })
+            .unwrap_or(80),
+    ));
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
@@ -79,4 +88,51 @@ async fn get_static_file(uri: Uri) -> Result<Response<BoxBody>, (StatusCode, Str
             format!("Something went wrong: {}", err),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+const VALID: &[(&str, &str)] = &[
+    ("bob", "sjhd76eww!"),
+    ("clem", "khsd54#h"),
+    ("alicia", "jhsjhsd222!"),
+    ("sue", "76shshs63!"),
+    ("plank", "5!ys!hhsds"),
+];
+
+async fn login_submit(Form(login): Form<LoginForm>) -> Redirect {
+    if VALID.contains(&(login.username.as_str(), login.password.as_str())) {
+        if login.username == "plank" {
+            Redirect::temporary("/admin")
+        } else {
+            Redirect::temporary(&format!("/logged_in?username={}", login.username))
+        }
+    } else {
+        Redirect::temporary("/login_fail")
+    }
+}
+
+async fn admin() -> Html<String> {
+    Html(static_file(["html", "admin.html"].into_iter().collect()).await)
+}
+
+async fn login_fail() -> Html<String> {
+    Html(static_file(["html", "login_fail.html"].into_iter().collect()).await)
+}
+
+#[derive(Deserialize)]
+struct LoggedInQuery {
+    username: String,
+}
+
+async fn logged_in(Query(LoggedInQuery { username }): Query<LoggedInQuery>) -> Html<String> {
+    Html(
+        static_file(["html", "logged_in.html"].into_iter().collect())
+            .await
+            .replace("REPLACE_USERNAME", &username),
+    )
 }
