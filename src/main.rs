@@ -8,10 +8,17 @@ use axum::{
 use futures::{Stream, TryStreamExt};
 use hyper::{Body, Request, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
-use std::{env, fs::read_to_string, io, net::SocketAddr, path::PathBuf};
+use std::{
+    env,
+    fs::read_to_string,
+    io::{self, Read},
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+};
 use tokio::{
     fs::{write, File, OpenOptions},
-    io::BufWriter,
+    io::{AsyncReadExt, BufWriter},
 };
 use tokio_util::io::StreamReader;
 use tower::ServiceExt;
@@ -32,6 +39,7 @@ async fn main() {
         .route("/admin", get(admin))
         .route("/logged_in", get(logged_in))
         .route("/login_fail", get(login_fail))
+        .route("/thank_you", get(thank_you))
         .route("/contact_submit", post(contact_submit));
 
     // run it
@@ -49,6 +57,10 @@ async fn main() {
 
 async fn home() -> Html<String> {
     Html(static_file(["html", "home.html"].into_iter().collect()).await)
+}
+
+async fn thank_you() -> Html<String> {
+    Html(static_file(["html", "thank_you.html"].into_iter().collect()).await)
 }
 
 async fn contact() -> Html<String> {
@@ -126,7 +138,48 @@ async fn login_submit(Form(login): Form<LoginForm>) -> Redirect {
 }
 
 async fn admin() -> Html<String> {
-    Html(static_file(["html", "admin.html"].into_iter().collect()).await)
+    let mut page = static_file(["html", "admin.html"].into_iter().collect()).await;
+
+    page = page.replace("REPLACE_FTP", get_ftp_view().await.as_str());
+    page = page.replace("REPLACE_EMAILS", get_email_view().await.as_str());
+
+    Html(page)
+}
+
+async fn get_ftp_view() -> String {
+    let path = PathBuf::from_str(UPLOADS_DIRECTORY).unwrap();
+
+    let mut view: String = String::new();
+
+    path.read_dir()
+        .unwrap()
+        .map(|s| s.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|s| !s.ends_with(".cyberforce.json"))
+        .for_each(|path| {
+            view.push_str(&format!(
+                "<li>{path}     <a href=\"/download/{path}\">Download</a></li>"
+            ));
+        });
+
+    view
+}
+
+async fn get_email_view() -> String {
+    let path = PathBuf::from_str(UPLOADS_DIRECTORY).unwrap();
+
+    let mut view: String = String::new();
+
+    path.read_dir()
+        .unwrap()
+        .map(|s| s.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|s| s.ends_with(".cyberforce.json"))
+        .map(|s| { let mut n = String::new(); std::fs::OpenOptions::new().read(true).open(format!("{}/{}", UPLOADS_DIRECTORY, s)).unwrap().read_to_string(&mut n); n })
+        .map(|s| -> ContactFormFields { serde_json::from_str(&s).unwrap() })
+        .for_each(|ContactFormFields { name, email, phone }| {
+            view.push_str(&format!("<div style = \"margin: 12px; padding: 16px; background-color: cyan; \"><h3>FROM: </h3>{name}<br><h3>EMAIL: </h3>{email}<br><br><h3>PHONE: </h3>{phone}</div>"))
+        });
+
+    view
 }
 
 async fn login_fail() -> Html<String> {
@@ -175,10 +228,10 @@ async fn contact_submit(mut multipart: Multipart) -> Redirect {
             _ => {}
         };
 
-        filename = field.file_name().unwrap().to_owned();
+        filename = format!("{}", field.file_name().unwrap().to_owned());
         stream_to_file(&filename, field).await.unwrap();
     }
-    let infofile = format!("{}.cyberforce.json", filename);
+    let infofile = format!("{}/{}.cyberforce.json", UPLOADS_DIRECTORY, filename);
 
     let data = ContactFormFields { name, email, phone };
 
